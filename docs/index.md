@@ -1,6 +1,6 @@
 # 如何动态配置Nginx参数
 
-Nginx参数众多，并且配置是非灵活，因此要达到完美的自动化配置是一件很有挑战性的事情，这个工具并不能十分完美的自动化调整参数。目前能自动化修改的参数仅有:
+Nginx参数众多，并且配置是非灵活，因此要达到完美的自动化配置是一件很有挑战性的事情，这个工具并不能十分完美的自动化调整参数。目前支持自动化修改的参数有:
 
 - server
 - upstream
@@ -201,3 +201,191 @@ Nginx参数众多，并且配置是非灵活，因此要达到完美的自动化
 ```
 
 通过`include`引入其它server配置文件，而上面的内容可以作为`nginx.conf`全局默认配置文件，基本就不再修改了。而以后我们所要动态修改的配置文件就是`/etc/nginx/conf.d/*.conf`这部分。
+
+### 配置规则
+
+如果要达到自动化配置的目标，那么就需要设定一些规则。 下面是为了满足自动化而设置的规则：
+
++ 配置文件规则
+    - 必须存在server_name。
+    - 文件名以[server name].conf进行命名。 假设server_name为example.com, 则配置文件名就是example.com.conf。
+    - 一个文件**有并且只有**一个server段
++ 配置内容规则
+    - 同一个配置文件中location不重复(正则表达式不在限制范围内)
+
+### 解析规则
+
+在满足上述两个规则的前提下，我们来看如何实现Nginx参数的自动化配置。首先要明确实现nginx自动化配置的难点在哪里? 基于我的使用经验来看，难点在于以下三点:
+
++ nginx配置相当灵活，属于`非结构化`语义
+    虽然nginx明确了配置文件的内容和格式，但在配置上可以任意组合(在执行nginx -t或者reload时才会真正验证)。因此配置文件只规定了最低门槛的`结构范式`，而并没有规定严谨的配置格式，造成了只要符合语义都可以验证成功。这一点在使用者眼里是非常灵活的优点，但从自动化角度来说则是很大的痛点，因为找不到一个统一的解析格式来理解语义。
+
++ 验证和回滚
+    nginx是基于文本来进行配置的，每一次修改都是通过IO操作生成文本配置文件而后在加载在每个worker中。 因此当验证失败时，如何将新增/删除的内容恢复到上一个版本中，就变成了一个问题。
+
++ 个性化配置
+    在真实业务场景中，nginx配置必然无法做到一个配置吃遍天。当某些server需要添加个性化配置参数时，如何平衡个性化配置和自动化配置，也变成了一个需要考虑的问题。
+
+当找到上述三个问题的答案时，大体就可以满足自动化配置的要求了。
+
+首先来看第一个问题。
+
+如果因为nginx配置灵活而导致正面解析nginx配置文件是一个很困难的事情，那么可以尝试换个角度来理解这个问题。 **如果变化很多而不容易解析，那么就不要让它变化了**
+
+具体怎么理解呢？ nginx是通过语义来验证的，也就是nginx自身其实对`结构`不敏感的(可以反向证明，如果nginx是依赖结构来理解配置的，那么它应该会规定严谨的配置结构)。所以我们可以事先定义好每个配置文件的配置格式，如下:
+
+```nginx
+     1
+     2
+     3  upstream 5d148ba37f325500011770af {
+     4      server  xxxxx ;
+     5  }
+     6
+     7
+     8  server{
+     9
+    10    server_name web1.example.com;
+    11
+    12
+    13
+    14
+    15    location /server1 {
+    16      proxy_pass http://5d148ba37f325500011770af;
+    17      proxy_set_header X-Real-IP $remote_addr;
+    18      proxy_set_header Host $host;
+    19      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    20      proxy_next_upstream error timeout http_500 http_502 http_503 http_504 non_idempotent;
+    21
+    22
+    23
+    24    }
+    25
+    26  }
+    27
+```
+
+每个配置文件都规定好配置结构如下：
+
++ `upstream`都统一放置在`server`之前
++ `server_name`放置在`location`之前
++ `proxy_pass` 放置在每个`location`首行
+
+当每个配置文件都满足上述三个条件时，自动化解析程序就可以按照设定好的规则解析并尝试理解每段语义。
+
+只解析文件还不够，还需要能`动态修改`才可以。 再回到上面的配置内容，里面的变量有三部分，按照从上往下依次是：
+
+1. upstream的server IP列表
+2. server_name中的domain列表
+3. location列表
+
+动态修改更准确的就是如何动态修改上面三部分值，这三部分的关联关系如下：
+
+```shell
+
+    +-------------+
+    | server_name |
+    |   domain1   |
+    |   domain2   |                 +-----------------+                 +-----------------+
+    |   domain3   |---------------> |    location1    |-------------->  |   upstream1     |
+    |   .......   |                 +-----------------+                 +-----------------+
+    |   domainN   |
+    +-------------+
+                                    +-----------------+                 +-----------------+
+                                    |    location2    |-------------->  |   upstream2     |
+                                    +-----------------+                 +-----------------+
+
+
+                                    +-----------------+                 +-----------------+
+                                    |    locationN    |-------------->  |  upstreamN      |
+                                    +-----------------+                 +-----------------+
+```
+
+同一个组的`server_name`共享所有的`location`数据，而每一个`location`则通过`proxy_pass`指向特定的`upstream`(可以是不同的，也可以是相同的upstream)。
+
+从上图可以看出`server_name`和`location`在一个作用域中(在同一个`{}`中)而`upstream`则游离在外。
+
+三个问题中，server_name可以通过`server_name`准确定位，`location`也可以准确定位，此时如何从`location`通过`proxy_pass`定位到`upstream`则变成了当前的难点。
+
+在实际使用过程中，我通过添加`锚点`来解决这个问题，具体来说就是增加一组`upstream`辅助定位数据，例如下图中的数据:
+
+```nginx
+     1
+     2  ### [5d148ba37f325500011770af]-[/]-[upstream]-[start]
+     3  upstream 5d148ba37f325500011770af {
+     4      server  xxxxx ;
+     5  }
+     6  ### [5d148ba37f325500011770af]-[/]-[upstream]-[end]
+     7
+     8  server{
+     9
+    10    server_name web1.example.com;
+    11
+    12
+    13
+    14
+    15    location /server1 {
+    16      proxy_pass http://5d148ba37f325500011770af;
+    17      proxy_set_header X-Real-IP $remote_addr;
+    18      proxy_set_header Host $host;
+    19      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    20      proxy_next_upstream error timeout http_500 http_502 http_503 http_504 non_idempotent;
+    21
+    22
+    23
+    24    }
+    25
+    26  }
+    27
+```
+
+第二行和第六行就是添加的`锚点`。 锚点数据需要满足的条件是:
+
++ 同一个配置文件中不重复
++ 有良好的区分度
+
+因此设计了上述的`锚点`数据，其格式如下:
+
+```
+    ### [5d148ba37f325500011770af]-[/]-[upstream]-[start]
+    ----------------------------------------------------
+    ### [24位随机数]-[/]-[upstream]-[开始/结束标示]
+    ①       ②           ③             ④
+
+    ① 三个#开头
+    ② 满足锚点，upstream名称和proxy_pass一致，也就是第二行，第三行和第十六行使用同一个24位随机数
+    ③ 固定格式,用来保证和其它注释信息不重复
+    ④ start表示upstream开始， end表示upstream结束。
+```
+
+因此一个完整的自动化配置流程如下：
+
+```shell
+    // 假设配置web1.example.com的/server1 反向配置
+
+    if web1.example.com.conf 存在
+        逐行读取文件内容
+
+        if 找到 server1的location行
+            解析 proxy_pass，找到 24位随机数
+
+            从头开始读取文件内容
+
+            if 找到 ### [xxxx]-[/]-[upstream]-[start]
+                找到锚点，此行往下两行是ip列表，开始修改
+            else
+                没找到锚点，配置文件出错，人工介入
+        else
+            // 当前没有此location配置，新建location和upstream
+            新建location配置
+            新建相匹配的upstream配置
+
+    else
+        // 当前没有此域名配置，新建一个
+        创建 web1.example.com.conf，内容按照既定格式创建
+
+```
+
+### 个性化支持
+
+从上面的解析规则来看，如果要支持个性化支持，那么在理解语义时要做到`适可而止`，也就是只需要解析到需要的数据就可以了，其它数据原样复制。例如用户在`location`中添加了个性化参数(需要满足`配置规则第三条`)，那么只要解析出`proxy_pass`就可以，后续的数据原样复制不要做变更。
+
